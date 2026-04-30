@@ -1,5 +1,7 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
+import net from 'node:net';
+import dns from 'node:dns/promises';
 
 const PORT = parseInt(process.env.PORT || '3128', 10);
 
@@ -41,7 +43,40 @@ function send407(res: http.ServerResponse): void {
   res.end('Proxy Authentication Required');
 }
 
-export function createProxyServer(): http.Server {
+function isPrivateIP(ip: string): boolean {
+  const parts = ip.split('.').map(Number);
+  if (parts.length === 4) {
+    if (parts[0] === 127) return true;
+    if (parts[0] === 10) return true;
+    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
+    if (parts[0] === 192 && parts[1] === 168) return true;
+    if (parts[0] === 0) return true;
+    if (parts[0] === 169 && parts[1] === 254) return true;
+  }
+  if (ip === '::1') return true;
+  if (ip.startsWith('fc') || ip.startsWith('fd')) return true;
+  return false;
+}
+
+async function resolveAndCheckSSRF(hostname: string): Promise<string> {
+  if (net.isIP(hostname)) {
+    if (isPrivateIP(hostname)) throw new Error('SSRF');
+    return hostname;
+  }
+  const { address } = await dns.lookup(hostname);
+  if (isPrivateIP(address)) throw new Error('SSRF');
+  return address;
+}
+
+function log(entry: { method: string; target: string; status: number; duration_ms: number }): void {
+  console.log(JSON.stringify({ ts: new Date().toISOString(), ...entry }));
+}
+
+interface ProxyOptions {
+  disableSSRF?: boolean;
+}
+
+export function createProxyServer(options: ProxyOptions = {}): http.Server {
   const server = http.createServer((req, res) => {
     // Health check — not a proxy request
     if (req.method === 'GET' && req.url === '/health') {
@@ -58,6 +93,34 @@ export function createProxyServer(): http.Server {
     // Placeholder — will be filled in later tasks
     res.writeHead(400);
     res.end('Bad Request');
+  });
+
+  server.on('connect', async (req: http.IncomingMessage, clientSocket: import('node:stream').Duplex, head: Buffer) => {
+    const start = Date.now();
+
+    if (!authenticate(req)) {
+      clientSocket.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="pip-proxy"\r\n\r\n');
+      clientSocket.destroy();
+      return;
+    }
+
+    const [hostname, portStr] = (req.url || '').split(':');
+    const port = parseInt(portStr || '443', 10);
+
+    if (!options.disableSSRF) {
+      try {
+        await resolveAndCheckSSRF(hostname);
+      } catch {
+        clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+        clientSocket.destroy();
+        log({ method: 'CONNECT', target: req.url || '', status: 403, duration_ms: Date.now() - start });
+        return;
+      }
+    }
+
+    // Tunnel establishment will be implemented in Task 5
+    clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+    clientSocket.destroy();
   });
 
   return server;

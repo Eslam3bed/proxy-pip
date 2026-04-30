@@ -17,6 +17,17 @@ async function startProxy(port: number): Promise<{ url: string; close: () => Pro
   };
 }
 
+async function startProxyStrict(port: number): Promise<{ url: string; close: () => Promise<void> }> {
+  const { createProxyServer } = await import('../src/index.js');
+  const server = createProxyServer(); // No disableSSRF option
+  await new Promise<void>((resolve) => server.listen(port, resolve));
+  const addr = server.address() as import('node:net').AddressInfo;
+  return {
+    url: `http://127.0.0.1:${addr.port}`,
+    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+  };
+}
+
 describe('Health Check', () => {
   before(async () => {
     process.env.PROXY_USERNAME = 'testuser';
@@ -85,5 +96,38 @@ describe('Authentication', () => {
       'Proxy-Authorization': `Basic ${badCreds}`,
     });
     assert.equal(res.status, 407);
+  });
+});
+
+describe('SSRF Protection', () => {
+  before(async () => {
+    process.env.PROXY_USERNAME = 'testuser';
+    process.env.PROXY_PASSWORD = 'testpass';
+    const result = await startProxyStrict(PROXY_PORT);
+    proxyUrl = result.url;
+    proxyProcess = result;
+  });
+
+  after(async () => {
+    await proxyProcess.close();
+  });
+
+  it('returns 403 when CONNECT targets a private IP', async () => {
+    const creds = Buffer.from('testuser:testpass').toString('base64');
+    const statusCode = await new Promise<number>((resolve, reject) => {
+      const req = http.request({
+        host: new URL(proxyUrl).hostname,
+        port: new URL(proxyUrl).port,
+        method: 'CONNECT',
+        path: '127.0.0.1:443',
+        headers: { 'Proxy-Authorization': `Basic ${creds}` },
+      });
+      req.on('connect', (res) => { resolve(res.statusCode ?? 0); });
+      req.on('response', (res) => { resolve(res.statusCode ?? 0); });
+      req.on('error', reject);
+      req.setTimeout(5000, () => { req.destroy(); reject(new Error('timeout')); });
+      req.end();
+    });
+    assert.equal(statusCode, 403);
   });
 });
