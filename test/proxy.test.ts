@@ -37,3 +37,53 @@ describe('Health Check', () => {
     assert.equal(body.status, 'ok');
   });
 });
+
+function httpRequest(url: string, headers: Record<string, string>): Promise<{ status: number; headers: Record<string, string> }> {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const options = {
+      hostname: parsed.hostname,
+      port: parseInt(parsed.port, 10),
+      path: parsed.pathname,
+      method: 'GET',
+      headers,
+    };
+    const req = http.request(options, (res) => {
+      resolve({ status: res.statusCode ?? 0, headers: res.headers as Record<string, string> });
+      res.resume();
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+describe('Authentication', () => {
+  before(async () => {
+    process.env.PROXY_USERNAME = 'testuser';
+    process.env.PROXY_PASSWORD = 'testpass';
+    const result = await startProxy(PROXY_PORT);
+    proxyUrl = result.url;
+    proxyProcess = result;
+  });
+
+  after(async () => {
+    await proxyProcess.close();
+  });
+
+  it('returns 407 when no Proxy-Authorization header is sent', async () => {
+    // Send a proxy-style request (absolute URI)
+    // Use http.request directly — Node 20 fetch throws on 407 responses
+    const res = await httpRequest(`${proxyUrl}/`, { Host: 'example.com' });
+    // Non-health, non-proxy request without auth → 407
+    assert.equal(res.status, 407);
+    assert.ok(res.headers['proxy-authenticate']?.includes('Basic'));
+  });
+
+  it('returns 407 when wrong credentials are sent', async () => {
+    const badCreds = Buffer.from('wrong:creds').toString('base64');
+    const res = await httpRequest(`${proxyUrl}/`, {
+      'Proxy-Authorization': `Basic ${badCreds}`,
+    });
+    assert.equal(res.status, 407);
+  });
+});
