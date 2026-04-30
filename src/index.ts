@@ -77,7 +77,9 @@ interface ProxyOptions {
 }
 
 export function createProxyServer(options: ProxyOptions = {}): http.Server {
-  const server = http.createServer((req, res) => {
+  const server = http.createServer(async (req, res) => {
+    const start = Date.now();
+
     // Health check — not a proxy request
     if (req.method === 'GET' && req.url === '/health') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -90,8 +92,62 @@ export function createProxyServer(options: ProxyOptions = {}): http.Server {
       return;
     }
 
-    // Placeholder — will be filled in later tasks
-    res.writeHead(400);
+    // HTTP forward proxy — detect by absolute URI
+    if (req.url && req.url.startsWith('http://')) {
+      const targetUrl = new URL(req.url);
+
+      if (!options.disableSSRF) {
+        try {
+          await resolveAndCheckSSRF(targetUrl.hostname);
+        } catch {
+          res.writeHead(403, { 'Content-Type': 'text/plain' });
+          res.end('Forbidden');
+          log({ method: req.method || 'GET', target: targetUrl.host, status: 403, duration_ms: Date.now() - start });
+          return;
+        }
+      }
+
+      const fwdHeaders = { ...req.headers, host: targetUrl.host };
+      delete fwdHeaders['proxy-authorization'];
+
+      const proxyReq = http.request(
+        {
+          hostname: targetUrl.hostname,
+          port: targetUrl.port || 80,
+          path: targetUrl.pathname + targetUrl.search,
+          method: req.method,
+          headers: fwdHeaders,
+        },
+        (proxyRes) => {
+          res.writeHead(proxyRes.statusCode || 502, proxyRes.headers);
+          proxyRes.pipe(res);
+          log({ method: req.method || 'GET', target: targetUrl.host, status: proxyRes.statusCode || 502, duration_ms: Date.now() - start });
+        },
+      );
+
+      proxyReq.on('error', () => {
+        if (!res.headersSent) {
+          res.writeHead(502, { 'Content-Type': 'text/plain' });
+          res.end('Bad Gateway');
+        }
+        log({ method: req.method || 'GET', target: targetUrl.host, status: 502, duration_ms: Date.now() - start });
+      });
+
+      proxyReq.setTimeout(30_000, () => {
+        if (!res.headersSent) {
+          res.writeHead(504, { 'Content-Type': 'text/plain' });
+          res.end('Gateway Timeout');
+        }
+        proxyReq.destroy();
+        log({ method: req.method || 'GET', target: targetUrl.host, status: 504, duration_ms: Date.now() - start });
+      });
+
+      req.pipe(proxyReq);
+      return;
+    }
+
+    // Not a proxy request and not health check
+    res.writeHead(400, { 'Content-Type': 'text/plain' });
     res.end('Bad Request');
   });
 

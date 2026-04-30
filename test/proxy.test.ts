@@ -185,3 +185,55 @@ describe('CONNECT Tunneling', () => {
     assert.equal(data, 'echo:hello');
   });
 });
+
+describe('HTTP Forward Proxy', () => {
+  let targetServer: http.Server;
+  let targetPort: number;
+
+  before(async () => {
+    process.env.PROXY_USERNAME = 'testuser';
+    process.env.PROXY_PASSWORD = 'testpass';
+
+    targetServer = http.createServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/plain', 'X-Test': 'forwarded' });
+      res.end(`received:${req.url}`);
+    });
+    await new Promise<void>((resolve) => targetServer.listen(0, '127.0.0.1', resolve));
+    targetPort = (targetServer.address() as net.AddressInfo).port;
+
+    const result = await startProxy(PROXY_PORT);
+    proxyUrl = result.url;
+    proxyProcess = result;
+  });
+
+  after(async () => {
+    await proxyProcess.close();
+    await new Promise<void>((resolve) => targetServer.close(() => resolve()));
+  });
+
+  it('forwards HTTP request and streams response back', async () => {
+    const creds = Buffer.from('testuser:testpass').toString('base64');
+    const res = await new Promise<http.IncomingMessage>((resolve, reject) => {
+      const req = http.request({
+        host: new URL(proxyUrl).hostname,
+        port: new URL(proxyUrl).port,
+        method: 'GET',
+        path: `http://127.0.0.1:${targetPort}/test-path`,
+        headers: { 'Proxy-Authorization': `Basic ${creds}` },
+      }, resolve);
+      req.on('error', reject);
+      req.setTimeout(5000, () => { req.destroy(); reject(new Error('timeout')); });
+      req.end();
+    });
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.headers['x-test'], 'forwarded');
+
+    const body = await new Promise<string>((resolve) => {
+      let data = '';
+      res.on('data', (chunk: Buffer) => { data += chunk.toString(); });
+      res.on('end', () => resolve(data));
+    });
+    assert.equal(body, 'received:/test-path');
+  });
+});
