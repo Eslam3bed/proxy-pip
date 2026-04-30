@@ -118,9 +118,37 @@ export function createProxyServer(options: ProxyOptions = {}): http.Server {
       }
     }
 
-    // Tunnel establishment will be implemented in Task 5
-    clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
-    clientSocket.destroy();
+    const targetSocket = net.connect({ host: hostname, port }, () => {
+      clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+      targetSocket.setNoDelay(true);
+      clientSocket.setNoDelay(true);
+
+      if (head.length > 0) {
+        targetSocket.write(head);
+      }
+
+      targetSocket.pipe(clientSocket);
+      clientSocket.pipe(targetSocket);
+
+      log({ method: 'CONNECT', target: req.url || '', status: 200, duration_ms: Date.now() - start });
+    });
+
+    targetSocket.setTimeout(30_000, () => {
+      clientSocket.write('HTTP/1.1 504 Gateway Timeout\r\n\r\n');
+      targetSocket.destroy();
+      clientSocket.destroy();
+      log({ method: 'CONNECT', target: req.url || '', status: 504, duration_ms: Date.now() - start });
+    });
+
+    targetSocket.on('error', () => {
+      clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+      clientSocket.destroy();
+      log({ method: 'CONNECT', target: req.url || '', status: 502, duration_ms: Date.now() - start });
+    });
+
+    clientSocket.on('error', () => {
+      targetSocket.destroy();
+    });
   });
 
   return server;

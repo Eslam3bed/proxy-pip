@@ -1,6 +1,7 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import net from 'node:net';
 
 const PROXY_PORT = 0; // OS assigns free port
 let proxyUrl: string;
@@ -8,7 +9,7 @@ let proxyProcess: { close: () => Promise<void> };
 
 async function startProxy(port: number): Promise<{ url: string; close: () => Promise<void> }> {
   const { createProxyServer } = await import('../src/index.js');
-  const server = createProxyServer();
+  const server = createProxyServer({ disableSSRF: true });
   await new Promise<void>((resolve) => server.listen(port, resolve));
   const addr = server.address() as import('node:net').AddressInfo;
   return {
@@ -129,5 +130,58 @@ describe('SSRF Protection', () => {
       req.end();
     });
     assert.equal(statusCode, 403);
+  });
+});
+
+describe('CONNECT Tunneling', () => {
+  let targetServer: net.Server;
+  let targetPort: number;
+
+  before(async () => {
+    process.env.PROXY_USERNAME = 'testuser';
+    process.env.PROXY_PASSWORD = 'testpass';
+
+    // TCP echo server as tunnel target
+    targetServer = net.createServer((socket) => {
+      socket.on('data', (data) => {
+        socket.write(`echo:${data.toString()}`);
+      });
+    });
+    await new Promise<void>((resolve) => targetServer.listen(0, '127.0.0.1', resolve));
+    targetPort = (targetServer.address() as net.AddressInfo).port;
+
+    const result = await startProxy(PROXY_PORT);
+    proxyUrl = result.url;
+    proxyProcess = result;
+  });
+
+  after(async () => {
+    await proxyProcess.close();
+    await new Promise<void>((resolve) => targetServer.close(() => resolve()));
+  });
+
+  it('establishes tunnel and pipes data bidirectionally', async () => {
+    const creds = Buffer.from('testuser:testpass').toString('base64');
+    const proxyUrlObj = new URL(proxyUrl);
+    const data = await new Promise<string>((resolve, reject) => {
+      const req = http.request({
+        host: proxyUrlObj.hostname,
+        port: proxyUrlObj.port,
+        method: 'CONNECT',
+        path: `127.0.0.1:${targetPort}`,
+        headers: { 'Proxy-Authorization': `Basic ${creds}` },
+      });
+      req.on('connect', (_res, socket) => {
+        socket.write('hello');
+        socket.on('data', (chunk) => {
+          resolve(chunk.toString());
+          socket.destroy();
+        });
+      });
+      req.on('error', reject);
+      req.setTimeout(5000, () => { req.destroy(); reject(new Error('timeout')); });
+      req.end();
+    });
+    assert.equal(data, 'echo:hello');
   });
 });
