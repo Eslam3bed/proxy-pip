@@ -151,7 +151,7 @@ export function createProxyServer(options: ProxyOptions = {}): http.Server {
     res.end('Bad Request');
   });
 
-  server.on('connect', async (req: http.IncomingMessage, clientSocket: import('node:stream').Duplex, head: Buffer) => {
+  server.on('connect', async (req: http.IncomingMessage, clientSocket: net.Socket, head: Buffer) => {
     const start = Date.now();
 
     if (!authenticate(req)) {
