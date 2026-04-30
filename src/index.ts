@@ -217,4 +217,20 @@ if (isMainModule) {
   server.listen(PORT, () => {
     console.log(JSON.stringify({ ts: new Date().toISOString(), msg: `proxy listening on port ${PORT}` }));
   });
+
+  const shutdown = () => {
+    console.log(JSON.stringify({ ts: new Date().toISOString(), msg: 'shutting down...' }));
+    server.close(() => {
+      console.log(JSON.stringify({ ts: new Date().toISOString(), msg: 'all connections drained, exiting' }));
+      process.exit(0);
+    });
+
+    setTimeout(() => {
+      console.log(JSON.stringify({ ts: new Date().toISOString(), msg: 'grace period expired, forcing exit' }));
+      process.exit(1);
+    }, 10_000).unref();
+  };
+
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
 }

@@ -237,3 +237,20 @@ describe('HTTP Forward Proxy', () => {
     assert.equal(body, 'received:/test-path');
   });
 });
+
+describe('Graceful Shutdown', () => {
+  it('stops accepting new connections after close is called', async () => {
+    process.env.PROXY_USERNAME = 'testuser';
+    process.env.PROXY_PASSWORD = 'testpass';
+    const result = await startProxy(PROXY_PORT);
+
+    const res = await fetch(`${result.url}/health`);
+    assert.equal(res.status, 200);
+
+    await result.close();
+
+    await assert.rejects(
+      () => fetch(`${result.url}/health`),
+    );
+  });
+});
