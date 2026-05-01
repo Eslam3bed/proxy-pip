@@ -3,7 +3,54 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
-import { execSync } from 'node:child_process';
+
+// Embedded self-signed test cert (valid 10 years, CN=localhost)
+const TEST_KEY = `-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDbIFIge7vYGEkJ
+/DU16OhV6Ff3tFOuf7gbWZ4Gg2Y5IfZ7xgN05JPHWwhsSoamSq/9DDrgvQ3IeKT+
+NEWwUbyChKASz0Y4zJ6gIz6U4jb5Q+XWMzobBh6SpuXp56+ttcEXzto75uolf6EQ
+w+V/S6SKDyO9wwVPDU8qs1wdNcKXoiWbAijnDXK2Wj8nBi/B4XcmOIu1/CVA/5NC
+3andyzA0enLt3znYlxOODEVUrQQ7ptMSnlY7jxxw/u2s0d+k/WE4GbLjwQ3nuOKA
+BkuySe43RDbsDEAGt71sbn+Gyf/0v7sIMwTKEhqDVYQwnoGhXk2xoYN95JM/5o/G
+8vgqSosjAgMBAAECggEBAMvqnALWosxKbU35gpsUj4HConpFOcqd2Hq7Py/Yf/yS
++oncj8LsJAnVUVVVVVDTGEtoYjJaPMVeYEyf4Gpg5gif20cl1Ldu0/86TTbH/Vii
+MvTO3zfezfyzjCnMDdSd23+IY9Zy4VrcFss/QgbgIdLIm/4vynTyccXO+93C9b+c
+z/RVz36kymgZo+6kSxs3oUs+p9ODTnp4KkxMrGPtTefUKrNBLFzhQ6s66z+unRpg
+WY8Lep0O8kwCLlxJYLVL/OLs2k3rWCtkFCcmF3JTv+YgGA60TZCnRWDstwCrG8l2
+VHZVakFrnQNRgYTSRg08TiSn2pl29cN4Xu9WpxQhleECgYEA+UfyfQWQ/2YNV8XM
+lsJeljIRlC73dBEsJGF4uGQIZgNXAGn8QyZ1ffMHPSxfYFhsXQ1ridTeYxn+ESMy
+X2avq26t3bot27d85qK7vacohhjVLo52fQcL3bqPoxfneK2Ls5D9C8VeZo3DfZ/i
+bhbWHZz0c8+iWVtYgcJFUw0K570CgYEA4QhNy7rZyF54m8oHRSZixhPNS15W3yrt
+yl5EavM7FXUllfp+NRRdHr7n/cDeLwHHyMgcgspq4SdeGq878p+qvEFuILTknqQ8
+lxfLrWOVpxL/5/LhwML4qeGliifJTsKNRxkCjwbcLIRtc/556TLGzRCjU3lUWJM2
+2mxZ3ltrfF8CgYADNdX9njC72UiatMVpu58UOBjZ27D8Iax723V+imtBRRG9w5+o
+Dbq9oH+bXhLsXrcmi6Gy6Lbkd9U5y0Y+zEe+4XIDxP4KMla9caMRUjHHaFJ2gwcr
+nQeeF2T6KLimaTW/XkKkACqzD2hRGdoEqO6g+wB67VWd6Ps+0I2sACL/0QKBgCHh
+SS0yLZXQO2JhMWUE2XwvAQqm4ndpFDISrURY6H1bjNQeyZ+eOELnxS/cONdk8jpV
+fo1mgl7xuWZVGbZ2uZLsWvNLqNwFqCWrbHvncWGdJ7A5TinicOPK2EyLnvBftDuP
+FWaJRt7g9UWwe5RTk8DOD3kC3GMVjv2lsIYcx3sLAoGAb8mWmFdtY+9QRsRKiONY
+VYCM+Jsij+kZDhFdzCKDeWv+1qvStTnamhqEPSWESS9BFplj7j1FrpBBw5XRaVyK
+1XpFHQFgDi1WBsgnitGIikhK1+Sp5RqZvCE6gNmVq4CnBIk1/sGcX7JR+76ltWFK
+dwdhZLqoDpoLMuhRXrdVoeY=
+-----END PRIVATE KEY-----`;
+
+const TEST_CERT = `-----BEGIN CERTIFICATE-----
+MIICpDCCAYwCCQDR65HuyBrmcDANBgkqhkiG9w0BAQsFADAUMRIwEAYDVQQDDAls
+b2NhbGhvc3QwHhcNMjYwNTAxMTA0NTM2WhcNMzYwNDI4MTA0NTM2WjAUMRIwEAYD
+VQQDDAlsb2NhbGhvc3QwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDb
+IFIge7vYGEkJ/DU16OhV6Ff3tFOuf7gbWZ4Gg2Y5IfZ7xgN05JPHWwhsSoamSq/9
+DDrgvQ3IeKT+NEWwUbyChKASz0Y4zJ6gIz6U4jb5Q+XWMzobBh6SpuXp56+ttcEX
+zto75uolf6EQw+V/S6SKDyO9wwVPDU8qs1wdNcKXoiWbAijnDXK2Wj8nBi/B4Xcm
+OIu1/CVA/5NC3andyzA0enLt3znYlxOODEVUrQQ7ptMSnlY7jxxw/u2s0d+k/WE4
+GbLjwQ3nuOKABkuySe43RDbsDEAGt71sbn+Gyf/0v7sIMwTKEhqDVYQwnoGhXk2x
+oYN95JM/5o/G8vgqSosjAgMBAAEwDQYJKoZIhvcNAQELBQADggEBADLflc5zWMUi
+lbtsMmCuTwfVZ03D4a9cEed/rB5Kat61U3Wq/78/QUaqfDLyKXAMsLvObQEHmroO
+2TzZGxrToy9xDgzPI3qgBthJvGDTJzHgNi+09YOjOBFlqbtLySjBBxF0+X7eAoxC
+NETG2GerPXQz4KdgOiYc15otX2vLvBkFUimM0BbpRr7xj1j7BePpkgTsZXK6nHgJ
+O/aen7wJT8nnFgL99p/UUc99kil4wk1XeTjI7/tlXvFy5SmRGKV07lARMFXp9UIi
+up/f6qcHP0gaoNlwaglPggYZYCt+C6bq7sCj73upCEraIZWG0gCQCzkURvWSihj+
+owWKcqpH4yQ=
+-----END CERTIFICATE-----`;
 
 const RELAY_PORT = 0; // OS assigns free port
 let relayUrl: string;
@@ -186,16 +233,7 @@ describe('HTTPS Target', () => {
   let httpsPort: number;
 
   before(async () => {
-    // Generate self-signed cert via openssl
-    const certOut = execSync(
-      'openssl req -x509 -newkey rsa:2048 -keyout /dev/stdout -out /dev/stdout -days 1 -nodes -subj "/CN=localhost" 2>/dev/null',
-      { encoding: 'utf-8' },
-    );
-    const keyMatch = certOut.match(/-----BEGIN PRIVATE KEY-----[\s\S]+?-----END PRIVATE KEY-----/);
-    const certMatch = certOut.match(/-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/);
-    if (!keyMatch || !certMatch) throw new Error('Failed to generate self-signed cert');
-
-    httpsServer = https.createServer({ key: keyMatch[0], cert: certMatch[0] }, (_req, res) => {
+    httpsServer = https.createServer({ key: TEST_KEY, cert: TEST_CERT }, (_req, res) => {
       res.writeHead(200, { 'Content-Type': 'text/plain', 'X-Secure': 'yes' });
       res.end('https-ok');
     });
