@@ -1,47 +1,9 @@
 import http from 'node:http';
-import crypto from 'node:crypto';
-import net from 'node:net';
+import https from 'node:https';
 import dns from 'node:dns/promises';
+import net from 'node:net';
 
-const PORT = parseInt(process.env.PORT || '3128', 10);
-
-function authenticate(req: http.IncomingMessage): boolean {
-  const username = process.env.PROXY_USERNAME;
-  const password = process.env.PROXY_PASSWORD;
-  if (!username || !password) return false;
-
-  const authHeader = req.headers['proxy-authorization'];
-  if (!authHeader || !authHeader.startsWith('Basic ')) return false;
-
-  const decoded = Buffer.from(authHeader.slice(6), 'base64').toString('utf-8');
-  const colonIndex = decoded.indexOf(':');
-  if (colonIndex === -1) return false;
-
-  const providedUser = decoded.slice(0, colonIndex);
-  const providedPass = decoded.slice(colonIndex + 1);
-
-  const userBuf = Buffer.from(providedUser);
-  const passBuf = Buffer.from(providedPass);
-  const expectedUserBuf = Buffer.from(username);
-  const expectedPassBuf = Buffer.from(password);
-
-  const userMatch =
-    userBuf.length === expectedUserBuf.length &&
-    crypto.timingSafeEqual(userBuf, expectedUserBuf);
-  const passMatch =
-    passBuf.length === expectedPassBuf.length &&
-    crypto.timingSafeEqual(passBuf, expectedPassBuf);
-
-  return userMatch && passMatch;
-}
-
-function send407(res: http.ServerResponse): void {
-  res.writeHead(407, {
-    'Proxy-Authenticate': 'Basic realm="pip-proxy"',
-    'Content-Type': 'text/plain',
-  });
-  res.end('Proxy Authentication Required');
-}
+const PORT = parseInt(process.env.PORT || '3000', 10);
 
 function isPrivateIP(ip: string): boolean {
   const parts = ip.split('.').map(Number);
@@ -58,70 +20,117 @@ function isPrivateIP(ip: string): boolean {
   return false;
 }
 
-async function resolveAndCheckSSRF(hostname: string): Promise<string> {
+async function resolveAndCheckSSRF(hostname: string): Promise<void> {
   if (net.isIP(hostname)) {
     if (isPrivateIP(hostname)) throw new Error('SSRF');
-    return hostname;
+    return;
   }
   const { address } = await dns.lookup(hostname);
   if (isPrivateIP(address)) throw new Error('SSRF');
-  return address;
 }
 
 function log(entry: { method: string; target: string; status: number; duration_ms: number }): void {
   console.log(JSON.stringify({ ts: new Date().toISOString(), ...entry }));
 }
 
-interface ProxyOptions {
-  disableSSRF?: boolean;
+interface RelayBody {
+  url: string;
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string; // base64-encoded
 }
 
-export function createProxyServer(options: ProxyOptions = {}): http.Server {
+function readBody(req: http.IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let data = '';
+    req.on('data', (chunk: Buffer) => { data += chunk.toString(); });
+    req.on('end', () => resolve(data));
+    req.on('error', reject);
+  });
+}
+
+interface RelayOptions {
+  disableSSRF?: boolean;
+  connectTimeout?: number;
+}
+
+export function createRelayServer(options: RelayOptions = {}): http.Server {
   const server = http.createServer(async (req, res) => {
     const start = Date.now();
 
-    // Health check — not a proxy request
+    // Health check
     if (req.method === 'GET' && req.url === '/health') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ status: 'ok' }));
       return;
     }
 
-    if (!authenticate(req)) {
-      send407(res);
-      return;
-    }
+    // Relay endpoint
+    if (req.method === 'POST' && req.url === '/relay') {
+      let parsed: RelayBody;
+      try {
+        const raw = await readBody(req);
+        parsed = JSON.parse(raw);
+      } catch {
+        res.writeHead(400, { 'Content-Type': 'text/plain' });
+        res.end('Bad Request');
+        return;
+      }
 
-    // HTTP forward proxy — detect by absolute URI
-    if (req.url && req.url.startsWith('http://')) {
-      const targetUrl = new URL(req.url);
+      if (!parsed.url) {
+        res.writeHead(400, { 'Content-Type': 'text/plain' });
+        res.end('Bad Request');
+        return;
+      }
 
+      let targetUrl: URL;
+      try {
+        targetUrl = new URL(parsed.url);
+      } catch {
+        res.writeHead(400, { 'Content-Type': 'text/plain' });
+        res.end('Bad Request');
+        return;
+      }
+
+      const targetHostname = targetUrl.hostname;
+
+      // SSRF protection
       if (!options.disableSSRF) {
         try {
-          await resolveAndCheckSSRF(targetUrl.hostname);
+          await resolveAndCheckSSRF(targetHostname);
         } catch {
           res.writeHead(403, { 'Content-Type': 'text/plain' });
           res.end('Forbidden');
-          log({ method: req.method || 'GET', target: targetUrl.host, status: 403, duration_ms: Date.now() - start });
+          log({ method: parsed.method || 'GET', target: targetHostname, status: 403, duration_ms: Date.now() - start });
           return;
         }
       }
 
-      const fwdHeaders = { ...req.headers, host: targetUrl.host };
-      delete fwdHeaders['proxy-authorization'];
+      const isHttps = targetUrl.protocol === 'https:';
+      const requestModule = isHttps ? https : http;
+      const defaultPort = isHttps ? 443 : 80;
 
-      const proxyReq = http.request(
+      const reqHeaders: Record<string, string> = parsed.headers || {};
+
+      const proxyReq = requestModule.request(
         {
-          hostname: targetUrl.hostname,
-          port: targetUrl.port || 80,
+          hostname: targetHostname,
+          port: parseInt(targetUrl.port, 10) || defaultPort,
           path: targetUrl.pathname + targetUrl.search,
-          method: req.method,
-          headers: fwdHeaders,
+          method: parsed.method || 'GET',
+          headers: reqHeaders,
         },
         (proxyRes) => {
-          res.writeHead(proxyRes.statusCode || 502, proxyRes.headers);
+          const status = proxyRes.statusCode || 502;
+          const responseHeaders = proxyRes.headers as Record<string, string | string[] | undefined>;
+
+          res.writeHead(200, {
+            'X-Relay-Status': String(status),
+            'X-Relay-Headers': JSON.stringify(responseHeaders),
+            'Content-Type': 'application/octet-stream',
+          });
           proxyRes.pipe(res);
-          log({ method: req.method || 'GET', target: targetUrl.host, status: proxyRes.statusCode || 502, duration_ms: Date.now() - start });
+          log({ method: parsed.method || 'GET', target: targetHostname, status, duration_ms: Date.now() - start });
         },
       );
 
@@ -130,92 +139,39 @@ export function createProxyServer(options: ProxyOptions = {}): http.Server {
           res.writeHead(502, { 'Content-Type': 'text/plain' });
           res.end('Bad Gateway');
         }
-        log({ method: req.method || 'GET', target: targetUrl.host, status: 502, duration_ms: Date.now() - start });
+        log({ method: parsed.method || 'GET', target: targetHostname, status: 502, duration_ms: Date.now() - start });
       });
 
-      proxyReq.setTimeout(30_000, () => {
+      proxyReq.setTimeout(options.connectTimeout ?? 30_000, () => {
         if (!res.headersSent) {
           res.writeHead(504, { 'Content-Type': 'text/plain' });
           res.end('Gateway Timeout');
         }
         proxyReq.destroy();
-        log({ method: req.method || 'GET', target: targetUrl.host, status: 504, duration_ms: Date.now() - start });
+        log({ method: parsed.method || 'GET', target: targetHostname, status: 504, duration_ms: Date.now() - start });
       });
 
-      req.pipe(proxyReq);
+      if (parsed.body) {
+        proxyReq.write(Buffer.from(parsed.body, 'base64'));
+      }
+      proxyReq.end();
       return;
     }
 
-    // Not a proxy request and not health check
+    // Unknown route
     res.writeHead(400, { 'Content-Type': 'text/plain' });
     res.end('Bad Request');
-  });
-
-  server.on('connect', async (req: http.IncomingMessage, clientSocket: net.Socket, head: Buffer) => {
-    const start = Date.now();
-
-    if (!authenticate(req)) {
-      clientSocket.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="pip-proxy"\r\n\r\n');
-      clientSocket.destroy();
-      return;
-    }
-
-    const [hostname, portStr] = (req.url || '').split(':');
-    const port = parseInt(portStr || '443', 10);
-
-    if (!options.disableSSRF) {
-      try {
-        await resolveAndCheckSSRF(hostname);
-      } catch {
-        clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
-        clientSocket.destroy();
-        log({ method: 'CONNECT', target: req.url || '', status: 403, duration_ms: Date.now() - start });
-        return;
-      }
-    }
-
-    const targetSocket = net.connect({ host: hostname, port }, () => {
-      clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-      targetSocket.setNoDelay(true);
-      clientSocket.setNoDelay(true);
-
-      if (head.length > 0) {
-        targetSocket.write(head);
-      }
-
-      targetSocket.pipe(clientSocket);
-      clientSocket.pipe(targetSocket);
-
-      log({ method: 'CONNECT', target: req.url || '', status: 200, duration_ms: Date.now() - start });
-    });
-
-    targetSocket.setTimeout(30_000, () => {
-      clientSocket.write('HTTP/1.1 504 Gateway Timeout\r\n\r\n');
-      targetSocket.destroy();
-      clientSocket.destroy();
-      log({ method: 'CONNECT', target: req.url || '', status: 504, duration_ms: Date.now() - start });
-    });
-
-    targetSocket.on('error', () => {
-      clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
-      clientSocket.destroy();
-      log({ method: 'CONNECT', target: req.url || '', status: 502, duration_ms: Date.now() - start });
-    });
-
-    clientSocket.on('error', () => {
-      targetSocket.destroy();
-    });
   });
 
   return server;
 }
 
-// Start server when run directly (not imported by tests)
+// Start server when run directly
 const isMainModule = process.argv[1]?.endsWith('index.ts') || process.argv[1]?.endsWith('index.js');
 if (isMainModule) {
-  const server = createProxyServer();
+  const server = createRelayServer();
   server.listen(PORT, () => {
-    console.log(JSON.stringify({ ts: new Date().toISOString(), msg: `proxy listening on port ${PORT}` }));
+    console.log(JSON.stringify({ ts: new Date().toISOString(), msg: `relay listening on port ${PORT}` }));
   });
 
   const shutdown = () => {

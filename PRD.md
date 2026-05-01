@@ -1,149 +1,144 @@
-# pip-proxy — Forward Proxy Service PRD
+# pip-proxy — HTTP Relay Service PRD
 
 ## Overview
 
-A lightweight, general-purpose HTTP forward proxy deployed on Railway. Its primary consumer is the `yt_to_storage_pip` service (deployed on Cloud Run), which routes YouTube API traffic through this proxy to avoid IP-based blocking.
+A lightweight HTTP relay deployed on Railway. The primary consumer is the `yt_to_storage_pip` service (deployed on Cloud Run), which sends outbound HTTP requests through this relay to avoid IP-based blocking by Google.
 
 ## Problem
 
-Google blocks Cloud Run IP ranges from accessing YouTube. The current workarounds (PO Token Server, Deno runtime, Cloudflare WARP) add complexity and are unreliable. A forward proxy on a different provider (Railway) provides a clean, non-blocked IP.
+Google blocks Cloud Run IP ranges from accessing YouTube. A forward proxy (CONNECT tunneling) doesn't work on Railway because Railway's HTTP routing layer intercepts CONNECT requests. An HTTP relay avoids this by making the outbound request server-side and streaming the response back.
 
 ## Solution
 
-A Node.js forward proxy that:
-- Accepts HTTP forward proxy requests (standard proxy protocol)
-- Supports the CONNECT method for HTTPS tunneling (required — YouTube uses HTTPS)
-- Authenticates every request with HTTP Basic Auth
+A Node.js HTTP relay that:
+- Receives fetch requests as JSON (`POST /relay`)
+- Makes the actual HTTP request to the target URL from Railway's IP
+- Streams the response (headers + body) back to the caller
 - Is stateless, single-process, minimal dependencies
+
+## How It Works
+
+```
+yt_to_storage_pip (Cloud Run)
+  → POST /relay
+    Body: { url, method, headers, body }
+  → pip-proxy (Railway)
+    fetches target URL from Railway's IP
+    streams response back (status + headers + body)
+  → YouTube (sees Railway IP, not Cloud Run IP)
+```
+
+The consumer's custom `fetch` function serializes each fetch call into a relay request. The relay executes it and returns the raw response. From `youtubei.js`'s perspective, it's just a normal fetch — the relay is transparent.
 
 ## Functional Requirements
 
-### FR-1: HTTP Forward Proxy
-- Handle standard HTTP proxy requests (absolute-URI in request line)
-- Support the HTTP CONNECT method for tunneling HTTPS traffic
-- Stream data bidirectionally without buffering (pipe TCP sockets)
+### FR-1: HTTP Relay Endpoint
 
-### FR-2: Basic Authentication
-- Every request (including CONNECT) must include a `Proxy-Authorization` header
-- Single credential pair: username + password, configured via environment variables
-- Reject unauthenticated requests with `407 Proxy Authentication Required`
-- Use timing-safe comparison to prevent timing attacks
+`POST /relay`
+
+**Request body (JSON):**
+```json
+{
+  "url": "https://www.youtube.com/...",
+  "method": "GET",
+  "headers": { "User-Agent": "...", "Accept": "..." },
+  "body": "optional base64-encoded body"
+}
+```
+
+**Response:**
+- Status code: mirrors the target's status code
+- Headers: `X-Relay-Status` with target status, `X-Relay-Headers` with JSON-encoded target response headers
+- Body: raw streamed body from target (no buffering)
+
+**Why this format:** The response body is streamed raw (not wrapped in JSON) so large video downloads pipe through without buffering. Response metadata goes in headers.
+
+### FR-2: Health Check
+- `GET /health` returns `200 OK`
 
 ### FR-3: Logging
-- Log each request: timestamp, method, target host, status, duration
-- Do NOT log credentials or request/response bodies
-- Structured JSON logs for Railway log viewer
-
-### FR-4: Health Check
-- `GET /health` returns `200 OK` (no auth required)
-- Used by Railway for container readiness
+- Log each relay request: timestamp, target hostname, status, duration
+- Do NOT log full URLs with query params or request/response bodies
+- Structured JSON logs
 
 ## Non-Functional Requirements
 
 ### NFR-1: Performance
-- Zero buffering — pipe streams directly between client and target
+- Stream response body directly — do not buffer in memory
 - Handle concurrent connections (at least 50 simultaneous)
-- Connection timeout: 30s for establishment, no timeout for active streams (video downloads can be long)
+- Request timeout: 30s for connection, no timeout for response streaming (video downloads can be long)
 
-### NFR-2: Security
-- No open proxy — all requests require valid Basic Auth
-- Do not resolve/follow redirects on behalf of the client
-- Reject proxy requests to private/internal IP ranges (127.x, 10.x, 192.168.x, 172.16-31.x) to prevent SSRF
+### NFR-2: Security (future)
+- Authentication will be added later
+- For now, the relay is open (no auth required)
+- SSRF protection: reject relay requests to private/internal IP ranges (127.x, 10.x, 192.168.x, 172.16-31.x)
 
 ### NFR-3: Reliability
 - Graceful shutdown on SIGTERM (drain active connections, 10s grace period)
-- Process crash recovery handled by Railway's container restart
 
 ### NFR-4: Simplicity
-- Single `index.ts` file (or minimal files)
-- Minimal dependencies — prefer Node.js built-in `http` and `net` modules
-- No framework (no Express, no Fastify)
+- Minimal files
+- Use Node.js built-in `http` module or lightweight framework
+- Minimal dependencies
 
 ## Environment Variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `PROXY_USERNAME` | Yes | Basic auth username |
-| `PROXY_PASSWORD` | Yes | Basic auth password |
-| `PORT` | No | Listen port (default: 3128) |
-| `LOG_LEVEL` | No | `info` or `debug` (default: `info`) |
+| `PORT` | No | Listen port (default: 3000) |
 
 ## Tech Stack
 
 - **Runtime:** Node.js 20
 - **Language:** TypeScript
-- **Dependencies:** Minimal — ideally just `typescript` and `tsx` for dev
 - **Deployment:** Railway (Dockerfile or Nixpacks)
 
-## API Behavior
+## Error Responses
 
-### Standard HTTP Proxy Request
-```
-GET http://example.com/path HTTP/1.1
-Proxy-Authorization: Basic base64(user:pass)
-```
-Proxy fetches the target and streams the response back.
-
-### CONNECT Tunnel (for HTTPS)
-```
-CONNECT www.youtube.com:443 HTTP/1.1
-Proxy-Authorization: Basic base64(user:pass)
-```
-Proxy establishes TCP connection to target, responds `200 Connection Established`, then pipes data bidirectionally. The proxy never sees the encrypted content.
-
-### Health Check
-```
-GET /health HTTP/1.1
-```
-Returns `200 OK` — no auth, not a proxy request (no absolute URI or CONNECT).
-
-### Error Responses
-- `407 Proxy Authentication Required` — missing or invalid credentials
-- `403 Forbidden` — target is a private IP (SSRF protection)
+- `400 Bad Request` — missing `url` in request body
+- `403 Forbidden` — target resolves to a private IP (SSRF protection)
 - `502 Bad Gateway` — cannot connect to target
-- `504 Gateway Timeout` — connection to target timed out
-
-## Deployment
-
-- **Platform:** Railway
-- **Dockerfile:** Multi-stage (build TypeScript, run with slim Node image)
-- **Resources:** Minimal — this is a pass-through proxy, CPU/memory usage is negligible
-- **Scaling:** Single instance is sufficient for single-consumer use
+- `504 Gateway Timeout` — target connection timed out
 
 ## Consumer Integration
 
-The primary consumer (`yt_to_storage_pip`) integrates by:
+The consumer (`yt_to_storage_pip`) creates a custom `fetch` function:
 
-1. Setting env var: `PROXY_URL=http://user:pass@<railway-host>:<port>`
-2. The app creates a proxy-aware `fetch` function using `undici` or `http-proxy-agent`
-3. Passes this custom fetch to `Innertube.create({ fetch: proxyFetch })`
-4. All YouTube API calls and video downloads route through the proxy
+```typescript
+function createRelayFetch(relayUrl: string): typeof fetch {
+  return async (input, init) => {
+    const targetUrl = typeof input === "string" ? input : input.toString();
+    const res = await fetch(`${relayUrl}/relay`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        url: targetUrl,
+        method: init?.method || "GET",
+        headers: init?.headers || {},
+        body: init?.body ? Buffer.from(init.body as any).toString("base64") : undefined,
+      }),
+    });
 
-### Authentication Flow
+    const status = parseInt(res.headers.get("x-relay-status") || String(res.status));
+    const targetHeaders = JSON.parse(res.headers.get("x-relay-headers") || "{}");
+
+    return new Response(res.body, { status, headers: targetHeaders });
+  };
+}
 ```
-yt_to_storage_pip (Cloud Run)
-  → CONNECT www.youtube.com:443
-    Proxy-Authorization: Basic base64(user:pass)
-  → pip-proxy (Railway)
-    validates credentials
-    opens TCP to www.youtube.com:443
-    responds: 200 Connection Established
-    pipes bidirectionally
-  → YouTube (sees Railway IP, not Cloud Run IP)
-```
 
-## Out of Scope
+This is passed to `Innertube.create({ fetch: relayFetch })`.
 
-- TLS on the proxy itself (Railway provides edge TLS via its routing layer)
-- Multiple credential pairs / API key management
-- Rate limiting (single consumer, trusted)
-- Caching (video streams are too large, YouTube responses are dynamic)
-- Access control lists / domain allowlisting (general-purpose proxy)
+## Out of Scope (for now)
+
+- Authentication (will be added later)
+- TLS on the relay itself (Railway provides edge TLS)
+- Rate limiting
+- Caching
+- WebSocket or streaming request bodies
 
 ## Success Criteria
 
-1. `yt_to_storage_pip` can fetch YouTube metadata through the proxy
-2. `yt_to_storage_pip` can stream full video downloads through the proxy
-3. All requests without valid Basic Auth are rejected
-4. Proxy adds < 50ms latency to connection establishment
-5. Video downloads stream without buffering or memory accumulation
+1. `yt_to_storage_pip` can fetch YouTube metadata through the relay
+2. `yt_to_storage_pip` can stream full video downloads through the relay
+3. Video downloads stream without buffering or memory accumulation on the relay
