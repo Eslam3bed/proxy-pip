@@ -106,55 +106,110 @@ export function createRelayServer(options: RelayOptions = {}): http.Server {
         }
       }
 
-      const isHttps = targetUrl.protocol === 'https:';
-      const requestModule = isHttps ? https : http;
-      const defaultPort = isHttps ? 443 : 80;
-
       const reqHeaders: Record<string, string> = parsed.headers || {};
+      const bodyBuffer = parsed.body ? Buffer.from(parsed.body, 'base64') : null;
 
-      const proxyReq = requestModule.request(
-        {
-          hostname: targetHostname,
-          port: parseInt(targetUrl.port, 10) || defaultPort,
-          path: targetUrl.pathname + targetUrl.search,
-          method: parsed.method || 'GET',
-          headers: reqHeaders,
-        },
-        (proxyRes) => {
-          const status = proxyRes.statusCode || 502;
-          const responseHeaders = proxyRes.headers as Record<string, string | string[] | undefined>;
+      const MAX_REDIRECTS = 5;
 
-          res.writeHead(200, {
-            'X-Relay-Status': String(status),
-            'X-Relay-Headers': JSON.stringify(responseHeaders),
-            'Content-Type': 'application/octet-stream',
-          });
-          proxyRes.pipe(res);
-          log({ method: parsed.method || 'GET', target: targetHostname, status, duration_ms: Date.now() - start });
-        },
-      );
-
-      proxyReq.on('error', () => {
-        if (!res.headersSent) {
+      function makeRequest(
+        url: URL,
+        method: string,
+        headers: Record<string, string>,
+        body: Buffer | null,
+        redirectCount: number,
+      ): void {
+        if (redirectCount > MAX_REDIRECTS) {
           res.writeHead(502, { 'Content-Type': 'text/plain' });
-          res.end('Bad Gateway');
+          res.end('Too many redirects');
+          log({ method, target: url.hostname, status: 502, duration_ms: Date.now() - start });
+          return;
         }
-        log({ method: parsed.method || 'GET', target: targetHostname, status: 502, duration_ms: Date.now() - start });
-      });
 
-      proxyReq.setTimeout(options.connectTimeout ?? 30_000, () => {
-        if (!res.headersSent) {
-          res.writeHead(504, { 'Content-Type': 'text/plain' });
-          res.end('Gateway Timeout');
+        const isHttps = url.protocol === 'https:';
+        const requestModule = isHttps ? https : http;
+        const defaultPort = isHttps ? 443 : 80;
+
+        const proxyReq = requestModule.request(
+          {
+            hostname: url.hostname,
+            port: parseInt(url.port, 10) || defaultPort,
+            path: url.pathname + url.search,
+            method,
+            headers,
+          },
+          (proxyRes) => {
+            const status = proxyRes.statusCode || 502;
+
+            // Follow redirects
+            if (status >= 300 && status < 400 && proxyRes.headers.location) {
+              proxyRes.resume();
+
+              let redirectUrl: URL;
+              try {
+                redirectUrl = new URL(proxyRes.headers.location, url.href);
+              } catch {
+                res.writeHead(502, { 'Content-Type': 'text/plain' });
+                res.end('Bad redirect URL');
+                log({ method, target: url.hostname, status: 502, duration_ms: Date.now() - start });
+                return;
+              }
+
+              // SSRF check the redirect target
+              if (!options.disableSSRF) {
+                resolveAndCheckSSRF(redirectUrl.hostname).then(() => {
+                  const redirectMethod = (status === 307 || status === 308) ? method : 'GET';
+                  const redirectBody = (status === 307 || status === 308) ? body : null;
+                  makeRequest(redirectUrl, redirectMethod, headers, redirectBody, redirectCount + 1);
+                }).catch(() => {
+                  res.writeHead(403, { 'Content-Type': 'text/plain' });
+                  res.end('Forbidden');
+                  log({ method, target: redirectUrl.hostname, status: 403, duration_ms: Date.now() - start });
+                });
+                return;
+              }
+
+              const redirectMethod = (status === 307 || status === 308) ? method : 'GET';
+              const redirectBody = (status === 307 || status === 308) ? body : null;
+              makeRequest(redirectUrl, redirectMethod, headers, redirectBody, redirectCount + 1);
+              return;
+            }
+
+            // Normal response — pipe back
+            const responseHeaders = proxyRes.headers as Record<string, string | string[] | undefined>;
+            res.writeHead(200, {
+              'X-Relay-Status': String(status),
+              'X-Relay-Headers': JSON.stringify(responseHeaders),
+              'Content-Type': 'application/octet-stream',
+            });
+            proxyRes.pipe(res);
+            log({ method, target: url.hostname, status, duration_ms: Date.now() - start });
+          },
+        );
+
+        proxyReq.on('error', () => {
+          if (!res.headersSent) {
+            res.writeHead(502, { 'Content-Type': 'text/plain' });
+            res.end('Bad Gateway');
+          }
+          log({ method, target: url.hostname, status: 502, duration_ms: Date.now() - start });
+        });
+
+        proxyReq.setTimeout(options.connectTimeout ?? 30_000, () => {
+          if (!res.headersSent) {
+            res.writeHead(504, { 'Content-Type': 'text/plain' });
+            res.end('Gateway Timeout');
+          }
+          proxyReq.destroy();
+          log({ method, target: url.hostname, status: 504, duration_ms: Date.now() - start });
+        });
+
+        if (body) {
+          proxyReq.write(body);
         }
-        proxyReq.destroy();
-        log({ method: parsed.method || 'GET', target: targetHostname, status: 504, duration_ms: Date.now() - start });
-      });
-
-      if (parsed.body) {
-        proxyReq.write(Buffer.from(parsed.body, 'base64'));
+        proxyReq.end();
       }
-      proxyReq.end();
+
+      makeRequest(targetUrl, parsed.method || 'GET', reqHeaders, bodyBuffer, 0);
       return;
     }
 
@@ -171,7 +226,7 @@ const isMainModule = process.argv[1]?.endsWith('index.ts') || process.argv[1]?.e
 if (isMainModule) {
   const server = createRelayServer();
   server.listen(PORT, () => {
-    console.log(JSON.stringify({ ts: new Date().toISOString(), msg: `relay listening on port ${PORT}` }));
+    console.log(JSON.stringify({ ts: new Date().toISOString(), msg: `relay listening on port ${PORT}`, port: PORT, endpoints: { health: '/health', relay: '/relay' } }));
   });
 
   const shutdown = () => {
