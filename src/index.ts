@@ -3,7 +3,15 @@ import https from 'node:https';
 import dns from 'node:dns/promises';
 import net from 'node:net';
 
+import { createRequire } from 'node:module';
+const require = createRequire(import.meta.url);
+const USER_AGENTS: string[] = require('./user-agents.json');
+
 const PORT = parseInt(process.env.PORT || '3000', 10);
+
+function randomUserAgent(): string {
+  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+}
 
 function isPrivateIP(ip: string): boolean {
   const parts = ip.split('.').map(Number);
@@ -107,6 +115,9 @@ export function createRelayServer(options: RelayOptions = {}): http.Server {
       }
 
       const reqHeaders: Record<string, string> = parsed.headers || {};
+      if (!reqHeaders['user-agent'] && !reqHeaders['User-Agent']) {
+        reqHeaders['User-Agent'] = randomUserAgent();
+      }
       const bodyBuffer = parsed.body ? Buffer.from(parsed.body, 'base64') : null;
 
       const MAX_REDIRECTS = 5;
