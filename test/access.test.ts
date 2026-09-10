@@ -78,9 +78,20 @@ describe('KeyStore', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it('degrades to memory-only when the data dir is unwritable', () => {
-    assert.equal(resolveDataDir('/proc/nonexistent-pip-dir'), null);
+  it('degrades to memory-only when the data dir cannot be created', () => {
+    // A directory whose parent is a regular file. mkdir fails ENOTDIR for
+    // root and non-root alike, on Linux and macOS.
+    //
+    // Do NOT reach for a path under /proc here: mkdirSync(recursive) against
+    // procfs blocks forever on Linux rather than throwing, which wedges the
+    // whole run.
+    const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'pip-nodir-')), 'a-file');
+    fs.writeFileSync(file, 'not a directory');
+
+    assert.equal(resolveDataDir(path.join(file, 'keys')), null);
     assert.equal(new KeyStore(null).persistent, false);
+
+    fs.rmSync(path.dirname(file), { recursive: true, force: true });
   });
 });
 
