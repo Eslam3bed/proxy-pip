@@ -21,7 +21,13 @@ RUN npm ci --omit=dev && npm cache clean --force
 
 COPY --from=builder /app/dist ./dist
 
-USER node
+# su-exec lets the entrypoint fix volume ownership as root and then drop to
+# `node` before the app starts. USER is deliberately not set here — the
+# entrypoint does the dropping, because the chown must happen first.
+RUN apk add --no-cache su-exec
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+ENTRYPOINT ["docker-entrypoint.sh"]
 
 # Only the HTTP port is EXPOSEd, and it matches what Railway actually runs.
 # Railway injects PORT=8080, so that is the port the relay binds in
