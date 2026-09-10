@@ -299,11 +299,19 @@ if (isMainModule) {
   const dataDir = resolveDataDir(process.env.DATA_DIR || '/data');
   const store = new KeyStore(dataDir);
 
+  // Railway injects RAILWAY_PUBLIC_DOMAIN and, once TCP Proxy is enabled,
+  // RAILWAY_TCP_PROXY_DOMAIN / _PORT. Preferring those over hand-set values
+  // means the settings page cannot drift from reality — re-creating the TCP
+  // proxy hands out a new port, and copying it by hand is the step everyone
+  // forgets. The PUBLIC_* vars stay as an override for non-Railway hosts.
+  const railwayDomain = process.env.RAILWAY_PUBLIC_DOMAIN;
   const settings: SettingsConfig = {
     adminPassword: process.env.ADMIN_PASSWORD || null,
-    publicRelayUrl: process.env.PUBLIC_RELAY_URL || `http://localhost:${PORT}`,
-    publicTcpHost: process.env.PUBLIC_TCP_HOST || null,
-    publicTcpPort: process.env.PUBLIC_TCP_PORT || null,
+    publicRelayUrl:
+      process.env.PUBLIC_RELAY_URL ||
+      (railwayDomain ? `https://${railwayDomain}` : `http://localhost:${PORT}`),
+    publicTcpHost: process.env.PUBLIC_TCP_HOST || process.env.RAILWAY_TCP_PROXY_DOMAIN || null,
+    publicTcpPort: process.env.PUBLIC_TCP_PORT || process.env.RAILWAY_TCP_PROXY_PORT || null,
   };
 
   const allowUnauthenticated = process.env.ALLOW_UNAUTHENTICATED_RELAY !== 'false';

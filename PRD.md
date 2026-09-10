@@ -70,8 +70,8 @@ Keys are created in the settings UI and are the credential for both transports.
 | `TCP_PORT` | `3129` | CONNECT listener — point Railway's TCP Proxy here |
 | `ADMIN_PASSWORD` | — | Unset disables `/settings` entirely |
 | `DATA_DIR` | `/data` | Needs a Railway volume, or keys are lost on redeploy |
-| `PUBLIC_RELAY_URL` | `http://localhost:$PORT` | Shown in the settings UI |
-| `PUBLIC_TCP_HOST` / `PUBLIC_TCP_PORT` | — | From Railway's TCP Proxy; without them no `yt-dlp` URL is generated |
+| `PUBLIC_RELAY_URL` | `https://$RAILWAY_PUBLIC_DOMAIN` | Auto-detected on Railway; falls back to localhost off-platform. |
+| `PUBLIC_TCP_HOST` / `PUBLIC_TCP_PORT` | `RAILWAY_TCP_PROXY_DOMAIN` / `_PORT` | Auto-detected on Railway once TCP Proxy is on. Set explicitly only when self-hosting elsewhere. |
 | `ALLOW_UNAUTHENTICATED_RELAY` | `true` | **Transitional.** Keeps `/relay` open so existing clients keep working. Set to `false` once every caller sends a secret. |
 
 ## Functional Requirements

@@ -23,7 +23,9 @@ function request(
   body?: string,
 ): Promise<{ status: number; body: string; headers: http.IncomingHttpHeaders }> {
   return new Promise((resolve, reject) => {
-    const req = http.request({ host: '127.0.0.1', port, ...options }, (res) => {
+    // agent:false — Node's global agent keeps sockets alive, and a pooled
+    // socket stops server.close() from ever draining, hanging the run.
+    const req = http.request({ host: '127.0.0.1', port, agent: false, ...options }, (res) => {
       let data = '';
       res.on('data', (c) => { data += c; });
       res.on('end', () => resolve({ status: res.statusCode || 0, body: data, headers: res.headers }));
