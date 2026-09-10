@@ -66,7 +66,7 @@ Keys are created in the settings UI and are the credential for both transports.
 
 | Var | Default | Notes |
 |---|---|---|
-| `PORT` | `3000` | HTTP edge listener |
+| `PORT` | `3000` local, **`8080` on Railway** | HTTP edge listener. Railway injects `PORT=8080`, so the public domain must target 8080 — not the local default. |
 | `TCP_PORT` | `3129` | CONNECT listener — point Railway's TCP Proxy here |
 | `ADMIN_PASSWORD` | — | Unset disables `/settings` entirely |
 | `DATA_DIR` | `/data` | Needs a Railway volume, or keys are lost on redeploy |
