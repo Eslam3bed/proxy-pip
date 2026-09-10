@@ -108,6 +108,10 @@ export function createConnectProxy(options: ConnectProxyOptions): http.Server {
         log({ method: req.method, target: target.hostname, status: 502, key: key.id, duration_ms: Date.now() - start });
       });
 
+      // Same reasoning as the CONNECT path: a client that goes away must not
+      // strand the upstream request.
+      res.on('close', () => upstream.destroy());
+
       req.pipe(upstream);
     };
 
@@ -182,7 +186,13 @@ export function createConnectProxy(options: ConnectProxyOptions): http.Server {
         log({ method: 'CONNECT', target: hostname, status: 502, key: key.id, duration_ms: Date.now() - start });
       });
 
+      // Tear the pair down together. A client that disconnects cleanly emits
+      // 'close' rather than 'error', so listening only for 'error' leaks the
+      // upstream socket — one per tunnel, and enough to stop a server from
+      // ever draining on close().
       clientSocket.on('error', () => upstream.destroy());
+      clientSocket.on('close', () => upstream.destroy());
+      upstream.on('close', () => clientSocket.destroy());
     };
 
     void open();

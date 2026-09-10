@@ -310,6 +310,37 @@ describe('CONNECT forward proxy', () => {
     assert.match(line, /^HTTP\/1\.1 407/);
   });
 
+  it('drains on close after a client disconnects, leaking no upstream socket', async () => {
+    // Regression: the proxy used to destroy the upstream socket only on a
+    // client 'error'. A clean disconnect emits 'close' instead, so the
+    // upstream lingered and close() never completed.
+    const store = new KeyStore(null);
+    const { key, secret } = store.create('engine');
+    const auth = Buffer.from(`${key.id}:${secret}`).toString('base64');
+
+    const solo = createConnectProxy({ store, disableSSRF: true, log: () => {} });
+    const soloPort = await listen(solo);
+
+    await new Promise<void>((resolve, reject) => {
+      const socket = net.connect(soloPort, '127.0.0.1', () => {
+        socket.write(`CONNECT 127.0.0.1:${targetPort} HTTP/1.1\r\nProxy-Authorization: Basic ${auth}\r\n\r\n`);
+      });
+      socket.once('data', (chunk) => {
+        if (!/^HTTP\/1\.1 200/.test(chunk.toString())) { reject(new Error(chunk.toString())); return; }
+        socket.end(); // clean FIN, not a reset
+        resolve();
+      });
+      socket.on('error', reject);
+    });
+
+    const drained = await Promise.race([
+      new Promise<boolean>((resolve) => solo.close(() => resolve(true))),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 5000)),
+    ]);
+
+    assert.equal(drained, true, 'server did not drain — an upstream socket leaked');
+  });
+
   it('establishes a tunnel and pipes bytes with valid credentials', async () => {
     const result = await new Promise<string>((resolve, reject) => {
       const socket = net.connect(proxyPort, '127.0.0.1', () => {
