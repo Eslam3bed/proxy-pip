@@ -23,6 +23,11 @@ COPY --from=builder /app/dist ./dist
 
 USER node
 
-EXPOSE 3000 3129
+# Only the HTTP port is EXPOSEd. Railway picks the public domain's target
+# port from EXPOSE, and listing two made it choose the CONNECT port and
+# black-hole every relay request behind a 407. The CONNECT listener is
+# reached through Railway TCP Proxy, which is configured explicitly and
+# does not need EXPOSE.
+EXPOSE 3000
 
 CMD ["node", "dist/index.js"]

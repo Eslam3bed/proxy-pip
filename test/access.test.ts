@@ -299,6 +299,15 @@ describe('CONNECT forward proxy', () => {
 
   after(() => { proxy.close(); target.close(); });
 
+  it('explains the misrouting when plain HTTP hits the proxy port', async () => {
+    // A public domain pointed at this port sends relative paths like /health.
+    // That must not look like an auth failure.
+    const res = await request(proxyPort, { method: 'GET', path: '/health' });
+    assert.equal(res.status, 421);
+    assert.match(res.body, /CONNECT forward-proxy port/);
+    assert.match(res.body, /wrong port/);
+  });
+
   it('407s a CONNECT with no Proxy-Authorization', async () => {
     const line = await new Promise<string>((resolve) => {
       const socket = net.connect(proxyPort, '127.0.0.1', () => {

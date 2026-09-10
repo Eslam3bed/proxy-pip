@@ -50,6 +50,27 @@ export function createConnectProxy(options: ConnectProxyOptions): http.Server {
   const server = http.createServer((req, res) => {
     // Plain-HTTP forward proxying uses an absolute URI in the request line.
     const start = Date.now();
+
+    // Diagnose the wiring before asking for credentials. A forward-proxy
+    // client always sends an absolute URI; a relative path means something is
+    // routing ordinary HTTP traffic here — usually a public domain pointed at
+    // this port instead of the relay's. Answering 407 in that case sends the
+    // operator hunting for a credential bug that does not exist.
+    let target: URL;
+    try {
+      target = new URL(req.url || '');
+      if (!target.protocol.startsWith('http')) throw new Error('not http');
+    } catch {
+      res.writeHead(421, { 'Content-Type': 'text/plain' });
+      res.end(
+        'This is the CONNECT forward-proxy port, reached via Railway TCP Proxy.\n' +
+        'It only serves absolute-URI proxy requests.\n' +
+        'The HTTP API (/health, /relay, /v1/verify, /settings) is on PORT.\n' +
+        'If you see this from a browser, a public domain is pointed at the wrong port.\n',
+      );
+      return;
+    }
+
     const key = authenticateProxyRequest(req.headers['proxy-authorization'], store);
     if (!key) {
       res.writeHead(407, {
@@ -57,15 +78,6 @@ export function createConnectProxy(options: ConnectProxyOptions): http.Server {
         'Content-Type': 'text/plain',
       });
       res.end('Proxy Authentication Required');
-      return;
-    }
-
-    let target: URL;
-    try {
-      target = new URL(req.url || '');
-    } catch {
-      res.writeHead(400, { 'Content-Type': 'text/plain' });
-      res.end('Bad Request — absolute URI required');
       return;
     }
 

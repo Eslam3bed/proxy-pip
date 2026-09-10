@@ -308,6 +308,16 @@ if (isMainModule) {
 
   const allowUnauthenticated = process.env.ALLOW_UNAUTHENTICATED_RELAY !== 'false';
 
+  // Refuse to start rather than let one listener win the bind and silently
+  // serve the wrong protocol on the public domain.
+  if (PORT === TCP_PORT) {
+    log({
+      level: 'error',
+      msg: `PORT and TCP_PORT are both ${PORT}. The HTTP API and the CONNECT proxy cannot share a port — set TCP_PORT to a different value.`,
+    });
+    process.exit(1);
+  }
+
   if (!dataDir) {
     log({ level: 'warn', msg: 'DATA_DIR is not writable — access keys are memory-only and will be lost on redeploy. Attach a Railway volume.' });
   }
