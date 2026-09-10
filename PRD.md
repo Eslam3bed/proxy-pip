@@ -30,6 +30,50 @@ yt_to_storage_pip (Cloud Run)
 
 The consumer's custom `fetch` function serializes each fetch call into a relay request. The relay executes it and returns the raw response. From `youtubei.js`'s perspective, it's just a normal fetch — the relay is transparent.
 
+## Access control & the CONNECT listener
+
+The relay serves two different kinds of client, on two different ports.
+
+| Consumer | Transport | Port | Why |
+|---|---|---|---|
+| `yt_to_storage_pip` (`youtubei.js`) | `POST /relay` JSON envelope | Railway HTTP edge | Its `fetch` is replaceable, so the envelope is transparent |
+| `core-engine` (`yt-dlp`) | Standard HTTP proxy — CONNECT | Railway **TCP Proxy** | `yt-dlp` only speaks `--proxy`; it cannot build a JSON envelope |
+
+CONNECT still does not work through Railway's HTTP edge (the edge intercepts it — see Problem above). The forward-proxy listener is therefore bound to a **separate port** exposed via Railway's TCP Proxy, which hands out a raw `host:port` and bypasses the HTTP router entirely.
+
+### Access keys
+
+Keys are created in the settings UI and are the credential for both transports.
+
+- Secrets are `scrypt`-hashed at rest. The plaintext is shown **once**, at creation.
+- `POST /relay` and `GET /v1/verify` authenticate with `Authorization: Bearer <secret>` (or `X-Relay-Secret`).
+- The CONNECT listener authenticates with `Proxy-Authorization: Basic base64(keyId:secret)` — which is exactly what `yt-dlp --proxy http://keyId:secret@host:port` sends.
+- Revoking a key takes effect immediately on both transports.
+
+### Endpoints
+
+| Route | Auth | Purpose |
+|---|---|---|
+| `GET /health` | none | Railway healthcheck |
+| `GET /settings` | Basic, `ADMIN_PASSWORD` | Key management UI |
+| `POST /settings/api/keys` | Basic, `ADMIN_PASSWORD` | Create a key → returns link + secret + `yt-dlp` proxy URL |
+| `POST /settings/api/keys/:id/revoke` | Basic, `ADMIN_PASSWORD` | Revoke |
+| `GET /v1/verify` | Bearer secret | Status probe — returns key identity and the **exit IP** |
+| `POST /relay` | Bearer secret | JSON relay |
+| CONNECT (TCP port) | Proxy-Authorization | Standard forward proxy |
+
+### Environment
+
+| Var | Default | Notes |
+|---|---|---|
+| `PORT` | `3000` | HTTP edge listener |
+| `TCP_PORT` | `3129` | CONNECT listener — point Railway's TCP Proxy here |
+| `ADMIN_PASSWORD` | — | Unset disables `/settings` entirely |
+| `DATA_DIR` | `/data` | Needs a Railway volume, or keys are lost on redeploy |
+| `PUBLIC_RELAY_URL` | `http://localhost:$PORT` | Shown in the settings UI |
+| `PUBLIC_TCP_HOST` / `PUBLIC_TCP_PORT` | — | From Railway's TCP Proxy; without them no `yt-dlp` URL is generated |
+| `ALLOW_UNAUTHENTICATED_RELAY` | `true` | **Transitional.** Keeps `/relay` open so existing clients keep working. Set to `false` once every caller sends a secret. |
+
 ## Functional Requirements
 
 ### FR-1: HTTP Relay Endpoint

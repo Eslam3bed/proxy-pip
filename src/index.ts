@@ -1,9 +1,12 @@
 import http from 'node:http';
 import https from 'node:https';
-import dns from 'node:dns/promises';
-import net from 'node:net';
+import { KeyStore, AccessKey, resolveDataDir } from './keys.js';
+import { handleSettings, SettingsConfig } from './settings.js';
+import { createConnectProxy } from './connect.js';
+import { resolveAndCheckSSRF } from './net-guard.js';
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
+const TCP_PORT = parseInt(process.env.TCP_PORT || '3129', 10);
 
 const USER_AGENTS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
@@ -22,31 +25,7 @@ function randomUserAgent(): string {
   return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
 }
 
-function isPrivateIP(ip: string): boolean {
-  const parts = ip.split('.').map(Number);
-  if (parts.length === 4) {
-    if (parts[0] === 127) return true;
-    if (parts[0] === 10) return true;
-    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
-    if (parts[0] === 192 && parts[1] === 168) return true;
-    if (parts[0] === 0) return true;
-    if (parts[0] === 169 && parts[1] === 254) return true;
-  }
-  if (ip === '::1') return true;
-  if (ip.startsWith('fc') || ip.startsWith('fd')) return true;
-  return false;
-}
-
-async function resolveAndCheckSSRF(hostname: string): Promise<void> {
-  if (net.isIP(hostname)) {
-    if (isPrivateIP(hostname)) throw new Error('SSRF');
-    return;
-  }
-  const { address } = await dns.lookup(hostname);
-  if (isPrivateIP(address)) throw new Error('SSRF');
-}
-
-function log(entry: { method: string; target: string; status: number; duration_ms: number }): void {
+function log(entry: Record<string, unknown>): void {
   console.log(JSON.stringify({ ts: new Date().toISOString(), ...entry }));
 }
 
@@ -66,24 +45,97 @@ function readBody(req: http.IncomingMessage): Promise<string> {
   });
 }
 
-interface RelayOptions {
+export interface RelayOptions {
   disableSSRF?: boolean;
   connectTimeout?: number;
+  store?: KeyStore;
+  settings?: SettingsConfig;
+  /**
+   * Keeps /relay open to unauthenticated callers. Defaults to true so that
+   * deploying key support does not instantly break already-running clients;
+   * set ALLOW_UNAUTHENTICATED_RELAY=false once every caller sends a secret.
+   */
+  allowUnauthenticated?: boolean;
+}
+
+/** Extract a relay secret from either supported header form. */
+function extractSecret(req: http.IncomingMessage): string {
+  const auth = req.headers.authorization;
+  if (auth?.startsWith('Bearer ')) return auth.slice(7).trim();
+  const custom = req.headers['x-relay-secret'];
+  if (typeof custom === 'string') return custom.trim();
+  return '';
+}
+
+let cachedExitIp: { value: string; at: number } | null = null;
+
+async function getExitIp(): Promise<string | null> {
+  if (cachedExitIp && Date.now() - cachedExitIp.at < 300_000) return cachedExitIp.value;
+  try {
+    const res = await fetch('https://api.ipify.org?format=json', {
+      signal: AbortSignal.timeout(4000),
+    });
+    const data = (await res.json()) as { ip?: string };
+    if (!data.ip) return null;
+    cachedExitIp = { value: data.ip, at: Date.now() };
+    return data.ip;
+  } catch {
+    return null;
+  }
 }
 
 export function createRelayServer(options: RelayOptions = {}): http.Server {
+  const store = options.store ?? new KeyStore(null);
+  const allowUnauthenticated = options.allowUnauthenticated ?? true;
+  const settings = options.settings;
+
   const server = http.createServer(async (req, res) => {
     const start = Date.now();
 
-    // Health check
+    // Health check — deliberately unauthenticated, used by Railway + uptime checks.
     if (req.method === 'GET' && req.url === '/health') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ status: 'ok' }));
       return;
     }
 
+    if (settings && (await handleSettings(req, res, store, settings))) return;
+
+    // Authenticated status probe — this is what an engine calls to render
+    // "proxy: connected" and to prove which IP its traffic egresses from.
+    if (req.method === 'GET' && req.url === '/v1/verify') {
+      const secret = extractSecret(req);
+      const key: AccessKey | null = secret ? store.verifySecret(secret) : null;
+      if (!key) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Invalid or missing access secret' }));
+        return;
+      }
+      const exitIp = await getExitIp();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        keyId: key.id,
+        name: key.name,
+        createdAt: key.createdAt,
+        exitIp,
+        tcpProxyConfigured: Boolean(settings?.publicTcpHost && settings?.publicTcpPort),
+      }));
+      return;
+    }
+
     // Relay endpoint
     if (req.method === 'POST' && req.url === '/relay') {
+      const secret = extractSecret(req);
+      const key = secret ? store.verifySecret(secret) : null;
+
+      if (!key && !allowUnauthenticated) {
+        res.writeHead(401, { 'Content-Type': 'text/plain' });
+        res.end('Unauthorized');
+        log({ method: 'POST', target: '/relay', status: 401, duration_ms: Date.now() - start });
+        return;
+      }
+
       let parsed: RelayBody;
       try {
         const raw = await readBody(req);
@@ -202,7 +254,7 @@ export function createRelayServer(options: RelayOptions = {}): http.Server {
               'Content-Type': 'application/octet-stream',
             });
             proxyRes.pipe(res);
-            log({ method, target: url.hostname, status, duration_ms: Date.now() - start });
+            log({ method, target: url.hostname, status, key: key?.id, duration_ms: Date.now() - start });
           },
         );
 
@@ -244,20 +296,59 @@ export function createRelayServer(options: RelayOptions = {}): http.Server {
 // Start server when run directly
 const isMainModule = process.argv[1]?.endsWith('index.ts') || process.argv[1]?.endsWith('index.js');
 if (isMainModule) {
-  const server = createRelayServer();
+  const dataDir = resolveDataDir(process.env.DATA_DIR || '/data');
+  const store = new KeyStore(dataDir);
+
+  const settings: SettingsConfig = {
+    adminPassword: process.env.ADMIN_PASSWORD || null,
+    publicRelayUrl: process.env.PUBLIC_RELAY_URL || `http://localhost:${PORT}`,
+    publicTcpHost: process.env.PUBLIC_TCP_HOST || null,
+    publicTcpPort: process.env.PUBLIC_TCP_PORT || null,
+  };
+
+  const allowUnauthenticated = process.env.ALLOW_UNAUTHENTICATED_RELAY !== 'false';
+
+  if (!dataDir) {
+    log({ level: 'warn', msg: 'DATA_DIR is not writable — access keys are memory-only and will be lost on redeploy. Attach a Railway volume.' });
+  }
+  if (!settings.adminPassword) {
+    log({ level: 'warn', msg: 'ADMIN_PASSWORD is not set — /settings is disabled.' });
+  }
+  if (allowUnauthenticated) {
+    log({ level: 'warn', msg: '/relay accepts unauthenticated requests. Set ALLOW_UNAUTHENTICATED_RELAY=false once every client sends a secret.' });
+  }
+
+  const server = createRelayServer({ store, settings, allowUnauthenticated });
   server.listen(PORT, () => {
-    console.log(JSON.stringify({ ts: new Date().toISOString(), msg: `relay listening on port ${PORT}`, port: PORT, endpoints: { health: '/health', relay: '/relay' } }));
+    log({
+      msg: `relay listening on port ${PORT}`,
+      port: PORT,
+      endpoints: { health: '/health', relay: '/relay', verify: '/v1/verify', settings: '/settings' },
+      activeKeys: store.count,
+      persistentKeys: store.persistent,
+    });
+  });
+
+  const connectProxy = createConnectProxy({ store, log });
+  connectProxy.listen(TCP_PORT, () => {
+    log({ msg: `connect proxy listening on port ${TCP_PORT}`, port: TCP_PORT });
   });
 
   const shutdown = () => {
-    console.log(JSON.stringify({ ts: new Date().toISOString(), msg: 'shutting down...' }));
-    server.close(() => {
-      console.log(JSON.stringify({ ts: new Date().toISOString(), msg: 'all connections drained, exiting' }));
-      process.exit(0);
-    });
+    log({ msg: 'shutting down...' });
+    let remaining = 2;
+    const done = () => {
+      remaining -= 1;
+      if (remaining === 0) {
+        log({ msg: 'all connections drained, exiting' });
+        process.exit(0);
+      }
+    };
+    server.close(done);
+    connectProxy.close(done);
 
     setTimeout(() => {
-      console.log(JSON.stringify({ ts: new Date().toISOString(), msg: 'grace period expired, forcing exit' }));
+      log({ msg: 'grace period expired, forcing exit' });
       process.exit(1);
     }, 10_000).unref();
   };
