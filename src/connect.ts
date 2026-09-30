@@ -8,6 +8,81 @@ export interface ConnectProxyOptions {
   disableSSRF?: boolean;
   connectTimeout?: number;
   log?: (entry: Record<string, unknown>) => void;
+  /**
+   * An upstream HTTP proxy to chain through, as a URL:
+   * `http://user:pass@host:port`. When set, every tunnel is opened by sending
+   * CONNECT to the upstream instead of dialling the target, so the exit
+   * address YouTube sees is the upstream's, not this host's. Unset means
+   * direct egress from this process, the original behaviour.
+   */
+  upstream?: string;
+}
+
+interface Upstream {
+  host: string;
+  port: number;
+  auth: string | null; // base64(user:pass), or null
+  label: string;       // host:port, safe to log
+}
+
+export function parseUpstream(url: string | undefined | null): Upstream | null {
+  if (!url) return null;
+  const u = new URL(url);
+  if (u.protocol !== 'http:') throw new Error(`UPSTREAM_PROXY must be an http:// URL, got ${u.protocol}`);
+  const auth = u.username
+    ? Buffer.from(`${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`).toString('base64')
+    : null;
+  return { host: u.hostname, port: parseInt(u.port, 10) || 80, auth, label: `${u.hostname}:${u.port || 80}` };
+}
+
+/**
+ * Open a tunnel to `hostname:port` through the upstream proxy. Resolves with
+ * the connected socket plus any bytes the upstream sent after its response
+ * headers, which belong to the target and must be forwarded to the client.
+ */
+function connectViaUpstream(
+  up: Upstream,
+  hostname: string,
+  port: number,
+  timeoutMs: number,
+): Promise<{ socket: net.Socket; leftover: Buffer; status: number }> {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect({ host: up.host, port: up.port });
+    let buffered = Buffer.alloc(0);
+    let done = false;
+    const fail = (err: Error) => {
+      if (done) return;
+      done = true;
+      socket.destroy();
+      reject(err);
+    };
+    const timer = setTimeout(() => fail(new Error('upstream connect timeout')), timeoutMs);
+    socket.once('error', fail);
+    socket.once('connect', () => {
+      const authLine = up.auth ? `Proxy-Authorization: Basic ${up.auth}\r\n` : '';
+      socket.write(`CONNECT ${hostname}:${port} HTTP/1.1\r\nHost: ${hostname}:${port}\r\n${authLine}\r\n`);
+    });
+    socket.on('data', (chunk: Buffer) => {
+      if (done) return;
+      buffered = Buffer.concat([buffered, chunk]);
+      const end = buffered.indexOf('\r\n\r\n');
+      if (end === -1) return;
+      done = true;
+      clearTimeout(timer);
+      socket.removeAllListeners('data');
+      socket.removeListener('error', fail);
+      const head = buffered.subarray(0, end).toString('latin1');
+      const status = parseInt(head.split(' ')[1] || '0', 10);
+      if (status !== 200) {
+        socket.destroy();
+        const err = new Error(`upstream answered ${status}`) as Error & { status: number };
+        err.status = status;
+        reject(err);
+        return;
+      }
+      resolve({ socket, leftover: buffered.subarray(end + 4), status });
+    });
+  });
 }
 
 function defaultLog(entry: Record<string, unknown>): void {
@@ -46,6 +121,8 @@ export function authenticateProxyRequest(
 export function createConnectProxy(options: ConnectProxyOptions): http.Server {
   const { store, disableSSRF = false, connectTimeout = 30_000 } = options;
   const log = options.log ?? defaultLog;
+  const up = parseUpstream(options.upstream);
+  const via = up ? up.label : 'direct';
 
   const server = http.createServer((req, res) => {
     // Plain-HTTP forward proxying uses an absolute URI in the request line.
@@ -98,17 +175,27 @@ export function createConnectProxy(options: ConnectProxyOptions): http.Server {
       delete headers['proxy-connection'];
 
       const upstream = http.request(
-        {
-          hostname: target.hostname,
-          port: parseInt(target.port, 10) || 80,
-          path: target.pathname + target.search,
-          method: req.method,
-          headers,
-        },
+        up
+          ? {
+              // An upstream forward proxy takes the absolute URI on the
+              // request line and its own credentials, same as we do.
+              hostname: up.host,
+              port: up.port,
+              path: target.href,
+              method: req.method,
+              headers: up.auth ? { ...headers, 'proxy-authorization': `Basic ${up.auth}` } : headers,
+            }
+          : {
+              hostname: target.hostname,
+              port: parseInt(target.port, 10) || 80,
+              path: target.pathname + target.search,
+              method: req.method,
+              headers,
+            },
         (upstreamRes) => {
           res.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
           upstreamRes.pipe(res);
-          log({ method: req.method, target: target.hostname, status: upstreamRes.statusCode, key: key.id, duration_ms: Date.now() - start });
+          log({ method: req.method, target: target.hostname, status: upstreamRes.statusCode, key: key.id, via, duration_ms: Date.now() - start });
         },
       );
 
@@ -164,6 +251,56 @@ export function createConnectProxy(options: ConnectProxyOptions): http.Server {
         }
       }
 
+      // One place records the outcome of every tunnel: how it was opened,
+      // how long it lived, how much moved each way, and who hung up. This is
+      // what tells a throttled exit apart from a dead tunnel from the logs
+      // alone: a 429 from YouTube is a short tunnel with a few KB down,
+      // a dead exit is a 502 or 504 with nothing.
+      const attach = (upstream: net.Socket, leftover: Buffer) => {
+        let bytesUp = 0;
+        let bytesDown = 0;
+        const opened = Date.now();
+        clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+        if (head?.length) upstream.write(head);
+        if (leftover.length) { clientSocket.write(leftover); bytesDown += leftover.length; }
+        upstream.on('data', (c: Buffer) => { bytesDown += c.length; });
+        clientSocket.on('data', (c: Buffer) => { bytesUp += c.length; });
+        // No timeout past this point — video downloads legitimately run long.
+        upstream.pipe(clientSocket);
+        clientSocket.pipe(upstream);
+        log({ method: 'CONNECT', target: hostname, status: 200, key: key.id, via, duration_ms: Date.now() - start });
+
+        let closed = false;
+        const finish = (closedBy: 'client' | 'upstream') => {
+          if (closed) return;
+          closed = true;
+          log({
+            event: 'tunnel_close', target: hostname, key: key.id, via, closed_by: closedBy,
+            bytes_up: bytesUp, bytes_down: bytesDown, duration_ms: Date.now() - opened,
+          });
+        };
+        // Tear the pair down together. A client that disconnects cleanly emits
+        // 'close' rather than 'error', so listening only for 'error' leaks the
+        // upstream socket — one per tunnel, and enough to stop a server from
+        // ever draining on close().
+        clientSocket.on('error', () => upstream.destroy());
+        clientSocket.on('close', () => { finish('client'); upstream.destroy(); });
+        upstream.on('close', () => { finish('upstream'); clientSocket.destroy(); });
+      };
+
+      if (up) {
+        try {
+          const { socket, leftover } = await connectViaUpstream(up, hostname, port, connectTimeout);
+          attach(socket, leftover);
+        } catch (err) {
+          const status = (err as { status?: number }).status;
+          const code = status === 407 ? 502 : status && status >= 400 ? 502 : /timeout/.test(String(err)) ? 504 : 502;
+          refuse(code, code === 504 ? 'Gateway Timeout' : 'Bad Gateway');
+          log({ method: 'CONNECT', target: hostname, status: code, key: key.id, via, upstream_status: status ?? null, duration_ms: Date.now() - start });
+        }
+        return;
+      }
+
       const upstream = net.connect({ host: hostname, port });
       let settled = false;
 
@@ -172,19 +309,14 @@ export function createConnectProxy(options: ConnectProxyOptions): http.Server {
         settled = true;
         upstream.destroy();
         refuse(504, 'Gateway Timeout');
-        log({ method: 'CONNECT', target: hostname, status: 504, key: key.id, duration_ms: Date.now() - start });
+        log({ method: 'CONNECT', target: hostname, status: 504, key: key.id, via, duration_ms: Date.now() - start });
       }, connectTimeout);
 
       upstream.on('connect', () => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-        if (head?.length) upstream.write(head);
-        // No timeout past this point — video downloads legitimately run long.
-        upstream.pipe(clientSocket);
-        clientSocket.pipe(upstream);
-        log({ method: 'CONNECT', target: hostname, status: 200, key: key.id, duration_ms: Date.now() - start });
+        attach(upstream, Buffer.alloc(0));
       });
 
       upstream.on('error', () => {
@@ -195,16 +327,8 @@ export function createConnectProxy(options: ConnectProxyOptions): http.Server {
         settled = true;
         clearTimeout(timer);
         refuse(502, 'Bad Gateway');
-        log({ method: 'CONNECT', target: hostname, status: 502, key: key.id, duration_ms: Date.now() - start });
+        log({ method: 'CONNECT', target: hostname, status: 502, key: key.id, via, duration_ms: Date.now() - start });
       });
-
-      // Tear the pair down together. A client that disconnects cleanly emits
-      // 'close' rather than 'error', so listening only for 'error' leaks the
-      // upstream socket — one per tunnel, and enough to stop a server from
-      // ever draining on close().
-      clientSocket.on('error', () => upstream.destroy());
-      clientSocket.on('close', () => upstream.destroy());
-      upstream.on('close', () => clientSocket.destroy());
     };
 
     void open();
