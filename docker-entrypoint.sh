@@ -9,10 +9,12 @@ set -e
 # the app, so nothing that touches the network ever runs as root.
 DATA_DIR="${DATA_DIR:-/data}"
 
+# warp-egress.sh is a no-op unless WARP_EGRESS=1; with it, it brings up the
+# Cloudflare WARP tunnel as `node` and chains the CONNECT listener through it.
 if [ "$(id -u)" = "0" ]; then
   mkdir -p "$DATA_DIR"
   chown -R node:node "$DATA_DIR"
-  exec su-exec node "$@"
+  exec su-exec node warp-egress.sh "$@"
 fi
 
-exec "$@"
+exec warp-egress.sh "$@"

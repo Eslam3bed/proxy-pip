@@ -347,9 +347,15 @@ if (isMainModule) {
     });
   });
 
-  const connectProxy = createConnectProxy({ store, log });
+  // UPSTREAM_PROXY chains every tunnel through another HTTP proxy, so the exit
+  // address becomes that proxy's. Unset means this host's own address.
+  const upstream = process.env.UPSTREAM_PROXY || undefined;
+  const connectProxy = createConnectProxy({ store, log, upstream });
   connectProxy.listen(TCP_PORT, () => {
-    log({ msg: `connect proxy listening on port ${TCP_PORT}`, port: TCP_PORT });
+    log({
+      msg: `connect proxy listening on port ${TCP_PORT}`, port: TCP_PORT,
+      egress: upstream ? `upstream ${new URL(upstream).host}` : 'direct',
+    });
   });
 
   const shutdown = () => {
