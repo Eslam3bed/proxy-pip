@@ -39,7 +39,7 @@ wgcf generate >/dev/null
 } > wireproxy.conf
 
 # Verbose, so a failed handshake is visible in the platform logs.
-wireproxy -c wireproxy.conf 2>&1 | sed -u 's/^/wireproxy: /' &
+wireproxy -c wireproxy.conf 2>&1 | sed 's/^/wireproxy: /' &
 WIREPROXY_PID=$!
 
 # Wait for the listener, then record the exit address YouTube will see. The
