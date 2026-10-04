@@ -38,17 +38,25 @@ wgcf generate >/dev/null
   printf '\n[http]\nBindAddress = 127.0.0.1:%s\n' "$WARP_HTTP_PORT"
 } > wireproxy.conf
 
-wireproxy -s -c wireproxy.conf &
+# Verbose, so a failed handshake is visible in the platform logs.
+wireproxy -c wireproxy.conf 2>&1 | sed -u 's/^/wireproxy: /' &
 WIREPROXY_PID=$!
 
-# Wait for the listener, then record the exit address YouTube will see.
+# Wait for the listener, then record the exit address YouTube will see. The
+# WireGuard handshake can finish seconds after the listener is up, so try a
+# few times before calling the exit unknown.
 i=0
-until nc -z 127.0.0.1 "$WARP_HTTP_PORT" 2>/dev/null; do
+until curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$WARP_HTTP_PORT/" 2>/dev/null; do
   i=$((i+1)); [ $i -gt 60 ] && { log "warp: wireproxy did not come up"; exit 1; }
   sleep 0.5
 done
-EXIT_IP=$(curl -s --max-time 15 -x "http://127.0.0.1:$WARP_HTTP_PORT" https://api.ipify.org || echo unknown)
-log "warp: egress ready" ",\"exitIp\":\"$EXIT_IP\",\"httpProxy\":\"127.0.0.1:$WARP_HTTP_PORT\""
+EXIT_IP=unknown
+for attempt in 1 2 3 4 5 6; do
+  got=$(curl -s --max-time 10 -x "http://127.0.0.1:$WARP_HTTP_PORT" https://api.ipify.org || true)
+  if [ -n "$got" ]; then EXIT_IP=$got; break; fi
+  sleep 5
+done
+log "warp: egress ready" ",\"exitIp\":\"$EXIT_IP\",\"httpProxy\":\"127.0.0.1:$WARP_HTTP_PORT\",\"attempts\":$attempt"
 
 # The CONNECT listener chains through the WARP proxy unless the operator set
 # an upstream of their own.
