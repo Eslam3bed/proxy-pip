@@ -45,18 +45,25 @@ WIREPROXY_PID=$!
 # Wait for the listener, then record the exit address YouTube will see. The
 # WireGuard handshake can finish seconds after the listener is up, so try a
 # few times before calling the exit unknown.
+# A TCP connect is the right readiness probe: wireproxy answers a bare GET
+# with a closed connection, which looks like a failure to curl.
 i=0
-until curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$WARP_HTTP_PORT/" 2>/dev/null; do
+until nc -z 127.0.0.1 "$WARP_HTTP_PORT" 2>/dev/null; do
   i=$((i+1)); [ $i -gt 60 ] && { log "warp: wireproxy did not come up"; exit 1; }
   sleep 0.5
 done
-EXIT_IP=unknown
-for attempt in 1 2 3 4 5 6; do
-  got=$(curl -s --max-time 10 -x "http://127.0.0.1:$WARP_HTTP_PORT" https://api.ipify.org || true)
-  if [ -n "$got" ]; then EXIT_IP=$got; break; fi
-  sleep 5
-done
-log "warp: egress ready" ",\"exitIp\":\"$EXIT_IP\",\"httpProxy\":\"127.0.0.1:$WARP_HTTP_PORT\",\"attempts\":$attempt"
+log "warp: listener up" ",\"httpProxy\":\"127.0.0.1:$WARP_HTTP_PORT\""
+
+# The exit-address check runs in the background so the app boots and passes
+# the platform healthcheck whether or not the handshake has finished yet.
+(
+  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    got=$(curl -s --max-time 10 -x "http://127.0.0.1:$WARP_HTTP_PORT" https://api.ipify.org || true)
+    if [ -n "$got" ]; then log "warp: egress ready" ",\"exitIp\":\"$got\",\"attempts\":$attempt"; exit 0; fi
+    sleep 5
+  done
+  log "warp: handshake never completed, exit unknown after 12 attempts"
+) &
 
 # The CONNECT listener chains through the WARP proxy unless the operator set
 # an upstream of their own.
