@@ -24,9 +24,21 @@ COPY --from=builder /app/dist ./dist
 # su-exec lets the entrypoint fix volume ownership as root and then drop to
 # `node` before the app starts. USER is deliberately not set here — the
 # entrypoint does the dropping, because the chown must happen first.
-RUN apk add --no-cache su-exec
-COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+#
+# wgcf and wireproxy power the optional WARP egress (WARP_EGRESS=1, see
+# warp-egress.sh). Pinned releases, fetched at build time, so the image is
+# hermetic; both run unprivileged. curl and netcat are for the readiness and
+# exit-address checks in that script.
+ARG WGCF_VERSION=2.3.0
+ARG WIREPROXY_VERSION=1.1.3
+RUN apk add --no-cache su-exec ca-certificates curl netcat-openbsd \
+    && wget -qO /usr/local/bin/wgcf "https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VERSION}/wgcf_${WGCF_VERSION}_linux_amd64" \
+    && chmod +x /usr/local/bin/wgcf \
+    && wget -qO /tmp/wireproxy.tar.gz "https://github.com/whyvl/wireproxy/releases/download/v${WIREPROXY_VERSION}/wireproxy_linux_amd64.tar.gz" \
+    && tar -xzf /tmp/wireproxy.tar.gz -C /usr/local/bin wireproxy \
+    && chmod +x /usr/local/bin/wireproxy && rm /tmp/wireproxy.tar.gz
+COPY docker-entrypoint.sh warp-egress.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh /usr/local/bin/warp-egress.sh
 ENTRYPOINT ["docker-entrypoint.sh"]
 
 # Only the HTTP port is EXPOSEd, and it matches what Railway actually runs.

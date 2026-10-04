@@ -387,3 +387,117 @@ describe('CONNECT forward proxy', () => {
     assert.equal(result, 'PONG');
   });
 });
+
+describe('CONNECT through an upstream proxy', () => {
+  let target: net.Server;
+  let targetPort: number;
+  let upstreamStore: KeyStore;
+  let upstream: http.Server;
+  let upstreamPort: number;
+  let upstreamCreds: { id: string; secret: string };
+  let frontStore: KeyStore;
+  let frontCreds: string;
+
+  before(async () => {
+    target = net.createServer((socket) => {
+      socket.on('data', () => socket.write('PONG'));
+    });
+    targetPort = await new Promise((resolve) => {
+      target.listen(0, () => resolve((target.address() as net.AddressInfo).port));
+    });
+
+    // The upstream is a second instance of this same proxy with its own key.
+    upstreamStore = new KeyStore(null);
+    const created = upstreamStore.create('upstream');
+    upstreamCreds = { id: created.key.id, secret: created.secret };
+    upstream = createConnectProxy({ store: upstreamStore, disableSSRF: true, log: () => {} });
+    upstreamPort = await listen(upstream);
+
+    frontStore = new KeyStore(null);
+    const { key, secret } = frontStore.create('engine');
+    frontCreds = Buffer.from(`${key.id}:${secret}`).toString('base64');
+  });
+
+  after(async () => {
+    await new Promise((r) => upstream.close(() => r(null)));
+    await new Promise((r) => target.close(() => r(null)));
+  });
+
+  function tunnel(frontPort: number): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const socket = net.connect(frontPort, '127.0.0.1', () => {
+        socket.write(`CONNECT 127.0.0.1:${targetPort} HTTP/1.1\r\nProxy-Authorization: Basic ${frontCreds}\r\n\r\n`);
+      });
+      let stage = 0;
+      socket.on('data', (d) => {
+        const text = d.toString();
+        if (stage === 0) {
+          stage = 1;
+          if (!/^HTTP\/1\.1 200/.test(text)) { resolve(text); socket.destroy(); return; }
+          socket.write('PING');
+        } else {
+          resolve(text);
+          socket.end();
+        }
+      });
+      socket.on('error', reject);
+    });
+  }
+
+  it('opens the tunnel by sending CONNECT to the upstream, so bytes reach the target', async () => {
+    const entries: Record<string, unknown>[] = [];
+    const front = createConnectProxy({
+      store: frontStore, disableSSRF: true, log: (e) => entries.push(e),
+      upstream: `http://${upstreamCreds.id}:${upstreamCreds.secret}@127.0.0.1:${upstreamPort}`,
+    });
+    const frontPort = await listen(front);
+    try {
+      assert.equal(await tunnel(frontPort), 'PONG');
+      const opened = entries.find((e) => e.method === 'CONNECT' && e.status === 200);
+      assert.ok(opened, 'logs the open');
+      assert.equal(opened!.via, `127.0.0.1:${upstreamPort}`);
+      // The close record carries the accounting a throttled-vs-dead diagnosis needs.
+      await new Promise((r) => setTimeout(r, 50));
+      const closed = entries.find((e) => e.event === 'tunnel_close');
+      assert.ok(closed, 'logs the close');
+      assert.equal(closed!.bytes_up, 4);
+      assert.equal(closed!.bytes_down, 4);
+      assert.ok(['client', 'upstream'].includes(closed!.closed_by as string));
+    } finally {
+      await new Promise((r) => front.close(() => r(null)));
+    }
+  });
+
+  it('answers 502 and logs the upstream status when the upstream refuses', async () => {
+    const entries: Record<string, unknown>[] = [];
+    const front = createConnectProxy({
+      store: frontStore, disableSSRF: true, log: (e) => entries.push(e),
+      upstream: `http://${upstreamCreds.id}:sk_wrong@127.0.0.1:${upstreamPort}`,
+    });
+    const frontPort = await listen(front);
+    try {
+      assert.match(await tunnel(frontPort), /^HTTP\/1\.1 502/);
+      const entry = entries.find((e) => e.status === 502);
+      assert.ok(entry);
+      assert.equal(entry!.upstream_status, 407);
+    } finally {
+      await new Promise((r) => front.close(() => r(null)));
+    }
+  });
+
+  it('still egresses directly, with via=direct in the log, when no upstream is set', async () => {
+    const entries: Record<string, unknown>[] = [];
+    const front = createConnectProxy({ store: frontStore, disableSSRF: true, log: (e) => entries.push(e) });
+    const frontPort = await listen(front);
+    try {
+      assert.equal(await tunnel(frontPort), 'PONG');
+      assert.equal(entries.find((e) => e.method === 'CONNECT' && e.status === 200)!.via, 'direct');
+    } finally {
+      await new Promise((r) => front.close(() => r(null)));
+    }
+  });
+
+  it('rejects a non-http upstream URL at construction', () => {
+    assert.throws(() => createConnectProxy({ store: frontStore, upstream: 'socks5://x:1080' }), /http:\/\//);
+  });
+});
